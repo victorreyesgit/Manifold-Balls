@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover" />
+<title>Manifold Explorer</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+<div id="canvas-container"></div>
+
+<button id="panel-toggle" aria-label="Toggle controls">Controls</button>
+
+<div id="panel">
+  <div class="panel-header">
+    <h1>Manifold Explorer</h1>
+    <p class="subtitle">A smoothly curved surface <span class="mono">z = A·sin(k₁u)·cos(k₂v)</span>, embedded in ℝ³</p>
+  </div>
+
+  <div class="section">
+    <h2>Capture</h2>
+    <button id="capture-photo" class="btn-secondary full">📷 Take Photo</button>
+    <button id="capture-video" class="btn-secondary full" style="margin-top:8px;">⏺ Record Video</button>
+  </div>
+
+  <div class="section">
+    <h2>Show / Hide</h2>
+
+    <h3 class="group-label">Manifold</h3>
+    <div class="check-grid">
+      <label class="check"><input type="checkbox" id="vis-surface" checked><span class="swatch" style="background:#8892a0"></span>Manifold</label>
+      <label class="check"><input type="checkbox" id="vis-points" checked><span class="swatch" style="background:#4da6ff"></span>Sample points</label>
+      <label class="check"><input type="checkbox" id="vis-point" checked><span class="swatch" style="background:#ff4d4d"></span>Reference point c</label>
+      <label class="check"><input type="checkbox" id="vis-ambient" checked><span class="swatch" style="background:#2f5dff"></span>Ambient ball</label>
+    </div>
+
+    <h3 class="group-label">Geometry</h3>
+    <div class="check-grid">
+      <label class="check"><input type="checkbox" id="vis-amb-plane"><span class="swatch" style="background:#2f5dff"></span>Tangent Ball</label>
+      <label class="check"><input type="checkbox" id="vis-amb-surf" checked><span class="swatch" style="background:#a855f7"></span>Extrinsic ball</label>
+      <label class="check"><input type="checkbox" id="vis-intrinsic"><span class="swatch" style="background:#ff8c2b"></span>Intrinsic ball</label>
+    </div>
+
+    <h3 class="group-label">Spatial reference</h3>
+    <div class="check-grid">
+      <label class="check"><input type="checkbox" id="vis-tangent"><span class="swatch" style="background:#42c7ff"></span>Tangent plane</label>
+      <label class="check"><input type="checkbox" id="vis-axes" checked><span class="swatch" style="background:#e6e6e6"></span>Ambient axis</label>
+      <label class="check"><input type="checkbox" id="vis-basis"><span class="swatch" style="background:#ff5fd1"></span>Tangent basis</label>
+      <label class="check"><input type="checkbox" id="vis-normal"><span class="swatch" style="background:#ffd23f"></span>Normal vector</label>
+      <label class="check"><input type="checkbox" id="vis-grid"><span class="swatch" style="background:#2b2f3a"></span>Floor frame</label>
+    </div>
+  </div>
+
+  <div class="section">
+    <h2>Radius</h2>
+    <div class="slider-row">
+      <label for="ballR">Ball radius</label>
+      <input type="range" id="ballR" min="0.1" max="2" step="0.02" value="1.0">
+      <output id="ballR-val"></output>
+    </div>
+    <p class="hint-note">Shared by the ambient ball, Tangent Ball, Extrinsic ball, and Intrinsic ball — one radius, compared three ways.</p>
+    <p class="hint-note">Tangent plane size, normal length and basis length are fixed at 1.5, 1.0 and 1.0.</p>
+  </div>
+
+  <div class="section">
+    <h2>Sample points</h2>
+    <div class="slider-row">
+      <label for="numPoints">Count</label>
+      <input type="range" id="numPoints" min="100" max="5000" step="50" value="1000">
+      <output id="numPoints-val"></output>
+    </div>
+  </div>
+
+  <div class="section">
+    <h2>Manifold shape</h2>
+    <div class="slider-row">
+      <label for="amp">Amplitude A</label>
+      <input type="range" id="amp" min="-2" max="2" step="0.02" value="1">
+      <output id="amp-val"></output>
+    </div>
+    <div class="slider-row">
+      <label for="kx">Freq. k₁ (u)</label>
+      <input type="range" id="kx" min="0.2" max="2.5" step="0.02" value="0.5">
+      <output id="kx-val"></output>
+    </div>
+    <div class="slider-row">
+      <label for="ky">Freq. k₂ (v)</label>
+      <input type="range" id="ky" min="0.2" max="2.5" step="0.02" value="0.5">
+      <output id="ky-val"></output>
+    </div>
+  </div>
+
+  <div class="section">
+    <h2>Reference point c <span class="hint">(or click the surface)</span></h2>
+    <div class="slider-row">
+      <label for="u0">u₀</label>
+      <input type="range" id="u0" min="-3.5" max="3.5" step="0.01" value="0.7">
+      <output id="u0-val"></output>
+    </div>
+    <div class="slider-row">
+      <label for="v0">v₀</label>
+      <input type="range" id="v0" min="-3.5" max="3.5" step="0.01" value="-0.5">
+      <output id="v0-val"></output>
+    </div>
+    <button id="reset-point" class="btn-secondary">Reset to origin</button>
+  </div>
+
+  <div class="section">
+    <h2>At c</h2>
+    <div class="readout" id="readout">—</div>
+  </div>
+
+  <div class="section legend">
+    <h2>Legend</h2>
+    <ul>
+      <li><span class="swatch" style="background:#4da6ff"></span>Sample points — fixed random points on the manifold</li>
+      <li><span class="swatch" style="background:#ff4d4d"></span>Reference point c — movable, drives everything below</li>
+      <li><span class="swatch" style="background:#2f5dff"></span>Ambient ball &amp; Tangent Ball (blue) — the sphere, and its exact cross-section in the tangent plane, radius = Ball radius</li>
+      <li><span class="swatch" style="background:#ff8c2b"></span>Intrinsic ball (orange) — geodesic ball, filled patch using geodesic distance</li>
+      <li><span class="swatch" style="background:#a855f7"></span>Extrinsic ball (purple) — ambient ball ∩ manifold, filled patch using straight-line distance</li>
+      <li><span class="swatch" style="background:#42c7ff"></span>Tangent plane — spanned by e₁, e₂</li>
+      <li><span class="swatch" style="background:#ff5fd1"></span>Tangent basis e₁ — X<sub>u</sub>/|X<sub>u</sub>|</li>
+      <li><span class="swatch" style="background:#63ff8a"></span>Tangent basis e₂ — ⟂ e₁ in the tangent plane</li>
+      <li><span class="swatch" style="background:#ffd23f"></span>Normal — unit vector ⟂ to T<sub>c</sub>M</li>
+    </ul>
+  </div>
+
+  <button id="reset-view" class="btn-secondary full">Reset camera</button>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/build/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+<script src="script.js"></script>
+</body>
+</html>
