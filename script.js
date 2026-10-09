@@ -183,16 +183,22 @@ function traceGeodesic(u0, v0, theta, length, steps) {
   let y = [u0, v0, du0, dv0];
   const h = length / steps;
   const pts = [{ u: u0, v: v0 }];
+  let exited = false;
   for (let i = 0; i < steps; i++) {
-    y = rk4Step(y, h);
-    // Renormalize speed under the metric to curb numerical drift.
-    const { E, F, G } = metricAt(y[0], y[1]);
-    const speed2 = E * y[2] * y[2] + 2 * F * y[2] * y[3] + G * y[3] * y[3];
-    if (speed2 > 1e-10) {
-      const s = 1 / Math.sqrt(speed2);
-      y[2] *= s; y[3] *= s;
+    if (!exited) {
+      y = rk4Step(y, h);
+      // Renormalize speed under the metric to curb numerical drift.
+      const { E, F, G } = metricAt(y[0], y[1]);
+      const speed2 = E * y[2] * y[2] + 2 * F * y[2] * y[3] + G * y[3] * y[3];
+      if (speed2 > 1e-10) {
+        const s = 1 / Math.sqrt(speed2);
+        y[2] *= s; y[3] *= s;
+      }
+      // Left the rendered manifold: freeze at the last valid point.
+      if (Math.abs(y[0]) > DOMAIN || Math.abs(y[1]) > DOMAIN) exited = true;
     }
-    pts.push({ u: y[0], v: y[1] });
+    if (exited) pts.push(pts[pts.length - 1]);
+    else pts.push({ u: y[0], v: y[1] });
   }
   return pts;
 }
@@ -212,16 +218,31 @@ function traceGeodesic(u0, v0, theta, length, steps) {
    distance to p equals the ambient radius.
    ========================================================================== */
 
+// Distance along the ray (u0,v0)+t*(du,dv) at which it leaves the rendered
+// domain [-DOMAIN,DOMAIN]^2.
+function rayDomainExitT(u0, v0, du, dv) {
+  let t = Infinity;
+  const EPS = 1e-9;
+  if (du > EPS) t = Math.min(t, (DOMAIN - u0) / du);
+  else if (du < -EPS) t = Math.min(t, (-DOMAIN - u0) / du);
+  if (dv > EPS) t = Math.min(t, (DOMAIN - v0) / dv);
+  else if (dv < -EPS) t = Math.min(t, (-DOMAIN - v0) / dv);
+  return Math.max(0, t);
+}
+
 function findAmbientSurfaceCrossingT(u0, v0, P, phi, R) {
   const du = Math.cos(phi), dv = Math.sin(phi);
-  let tHi = 0.1;
-  const maxT = 3 * DOMAIN;
+  const maxT = rayDomainExitT(u0, v0, du, dv);
+  if (maxT <= 0) return 0;
+  // If even the domain edge is within R of c, the ball spills past the
+  // visible manifold: clip it exactly at the edge.
+  if (point3D(u0 + du * maxT, v0 + dv * maxT).distanceTo(P) <= R) return maxT;
+  let tHi = Math.min(0.1, maxT);
   while (tHi < maxT) {
     const d = point3D(u0 + du * tHi, v0 + dv * tHi).distanceTo(P);
     if (d > R) break;
-    tHi *= 1.5;
+    tHi = Math.min(tHi * 1.5, maxT);
   }
-  if (tHi > maxT) tHi = maxT;
   let lo = 0, hi = tHi;
   for (let i = 0; i < 30; i++) {
     const mid = (lo + hi) / 2;
@@ -410,7 +431,8 @@ scene.add(normalArrow, e1Arrow, e2Arrow);
 /* ---- Intrinsic ball: geodesic ball (fill + boundary) ---- */
 let geoBallGeom = new THREE.BufferGeometry();
 const geoBallMat = new THREE.MeshBasicMaterial({
-  color: COLOR_INTRINSIC, side: THREE.DoubleSide, transparent: true, opacity: 0.62, depthWrite: false,
+  color: COLOR_INTRINSIC, side: THREE.DoubleSide, transparent: true, opacity: 0.92, depthWrite: false,
+  polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -1,
 });
 const geoBallMesh = new THREE.Mesh(geoBallGeom, geoBallMat);
 geoBallMesh.renderOrder = 1; // draw before the extrinsic ball, for consistent overlap rendering
@@ -456,7 +478,8 @@ scene.add(ambPlaneLine);
 
 let ambSurfGeom = new THREE.BufferGeometry();
 const ambSurfFillMat = new THREE.MeshBasicMaterial({
-  color: COLOR_EXTRINSIC, side: THREE.DoubleSide, transparent: true, opacity: 0.62, depthWrite: false,
+  color: COLOR_EXTRINSIC, side: THREE.DoubleSide, transparent: true, opacity: 0.92, depthWrite: false,
+  polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -1,
 });
 const ambSurfMesh = new THREE.Mesh(ambSurfGeom, ambSurfFillMat);
 ambSurfMesh.renderOrder = 2; // draw after the intrinsic ball, for consistent overlap rendering
@@ -466,6 +489,38 @@ let ambSurfBoundaryGeom = new THREE.BufferGeometry();
 const ambSurfMat = new THREE.LineBasicMaterial({ color: COLOR_EXTRINSIC, linewidth: 2 });
 const ambSurfLine = new THREE.LineLoop(ambSurfBoundaryGeom, ambSurfMat);
 scene.add(ambSurfLine);
+
+/* ---- Intrinsic ∩ Extrinsic: diamond (harlequin) pattern of both colors ----
+   Drawn only where the two balls overlap. The texture is an orange tile
+   with an inscribed purple rhombus; tiled, it gives alternating orange and
+   purple diamonds of equal area. UVs are the (u,v) surface coordinates, so
+   the pattern stays fixed to the manifold as the balls change size. */
+function makeDiamondTexture() {
+  const s = 64;
+  const canvas = document.createElement('canvas');
+  canvas.width = s; canvas.height = s;
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = '#' + COLOR_INTRINSIC.toString(16).padStart(6, '0');
+  ctx.fillRect(0, 0, s, s);
+  ctx.fillStyle = '#' + COLOR_EXTRINSIC.toString(16).padStart(6, '0');
+  ctx.beginPath();
+  ctx.moveTo(s / 2, 0); ctx.lineTo(s, s / 2); ctx.lineTo(s / 2, s); ctx.lineTo(0, s / 2);
+  ctx.closePath();
+  ctx.fill();
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+  tex.magFilter = THREE.NearestFilter;
+  return tex;
+}
+const DIAMOND_TILE = 0.16; // world size of one diamond tile, in (u,v) units
+let intersectGeom = new THREE.BufferGeometry();
+const intersectMat = new THREE.MeshBasicMaterial({
+  map: makeDiamondTexture(), side: THREE.DoubleSide, transparent: true, opacity: 1, depthWrite: false,
+  polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2,
+});
+const intersectMesh = new THREE.Mesh(intersectGeom, intersectMat);
+intersectMesh.renderOrder = 3;
+scene.add(intersectMesh);
 
 /* ---- Orientation axes: a small, unlabeled RGB triad that repositions
    itself to the far corner of the surface (relative to the camera) each
@@ -666,6 +721,69 @@ function rebuildIndicators() {
   geoBoundaryGeom.setAttribute('position', new THREE.BufferAttribute(new Float32Array(boundaryVerts), 3));
   geoBoundaryLine.geometry = geoBoundaryGeom;
 
+  // Intrinsic ∩ Extrinsic. Both balls are star-shaped around c, so along any
+  // straight ray in (u,v) the overlap runs out to the SMALLER of the two
+  // radial extents. The extrinsic extent comes from the ambient-distance
+  // search; the intrinsic extent is where the ray leaves the geodesic ball's
+  // boundary polygon (its outer ring of (u,v) points).
+  {
+    const poly = [];
+    for (let d = 0; d < GEO_DIRECTIONS; d++) poly.push(paths[d][GEO_RINGS]);
+
+    const rayPolygonExitT = (du, dv) => {
+      let best = -1;
+      for (let i = 0; i < poly.length; i++) {
+        const A = poly[i], B = poly[(i + 1) % poly.length];
+        const ex = B.u - A.u, ev = B.v - A.v;
+        const det = -du * ev + ex * dv;
+        if (Math.abs(det) < 1e-12) continue;
+        const t = (-(A.u - u0) * ev + ex * (A.v - v0)) / det;
+        const s = (du * (A.v - v0) - dv * (A.u - u0)) / det;
+        if (t >= 0 && s >= 0 && s <= 1 && t > best) best = t;
+      }
+      return best; // -1 if the ray never meets the polygon
+    };
+
+    const N_I = AMB_SURF_DIRECTIONS;
+    const extent = new Float64Array(N_I);
+    for (let i = 0; i < N_I; i++) {
+      const phi = (2 * Math.PI * i) / N_I;
+      const du = Math.cos(phi), dv = Math.sin(phi);
+      const rExt = findAmbientSurfaceCrossingT(u0, v0, P, phi, state.ballRadius);
+      const rInt = rayPolygonExitT(du, dv);
+      extent[i] = rInt < 0 ? rExt : Math.min(rExt, rInt);
+    }
+
+    const LIFT = 0.004; // tiny lift so the pattern sits above both ball fills
+    const iVerts = [P.x, P.y + LIFT, P.z];
+    const iUVs = [u0 / DIAMOND_TILE, v0 / DIAMOND_TILE];
+    for (let r = 1; r <= AMB_SURF_RINGS; r++) {
+      for (let i = 0; i < N_I; i++) {
+        const phi = (2 * Math.PI * i) / N_I;
+        const t = (r / AMB_SURF_RINGS) * extent[i];
+        const u = u0 + Math.cos(phi) * t, v = v0 + Math.sin(phi) * t;
+        iVerts.push(u, f(u, v) + LIFT, v);
+        iUVs.push(u / DIAMOND_TILE, v / DIAMOND_TILE);
+      }
+    }
+    const iIdx = (r, d) => 1 + (r - 1) * N_I + d;
+    const iFaces = [];
+    for (let d = 0; d < N_I; d++) iFaces.push(0, iIdx(1, d), iIdx(1, (d + 1) % N_I));
+    for (let r = 2; r <= AMB_SURF_RINGS; r++) {
+      for (let d = 0; d < N_I; d++) {
+        const dn = (d + 1) % N_I;
+        const a = iIdx(r - 1, d), b = iIdx(r - 1, dn), c = iIdx(r, d), dd = iIdx(r, dn);
+        iFaces.push(a, c, b, b, c, dd);
+      }
+    }
+    intersectGeom.dispose();
+    intersectGeom = new THREE.BufferGeometry();
+    intersectGeom.setAttribute('position', new THREE.BufferAttribute(new Float32Array(iVerts), 3));
+    intersectGeom.setAttribute('uv', new THREE.BufferAttribute(new Float32Array(iUVs), 2));
+    intersectGeom.setIndex(iFaces);
+    intersectMesh.geometry = intersectGeom;
+  }
+
   // Readout
   const K = gaussianCurvatureAt(u0, v0);
   const { E, F, G } = metricAt(u0, v0);
@@ -690,6 +808,7 @@ function applyVisibility() {
   ambPlaneLine.visible = v.ambientPlaneCircle;
   ambSurfMesh.visible = v.ambientSurfaceCurve;
   ambSurfLine.visible = v.ambientSurfaceCurve;
+  intersectMesh.visible = v.geodesicBall && v.ambientSurfaceCurve;
   axesHelper.visible = v.axes;
   gridHelper.visible = v.grid;
   samplePointsObj.visible = v.points;
