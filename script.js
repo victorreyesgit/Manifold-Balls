@@ -15,7 +15,7 @@ const GEO_RINGS = 14;      // radial steps per geodesic (resolution of the ball 
 const AMB_SURF_DIRECTIONS = 64; // angular samples for the ambient-ball/surface curve
 const AMB_SURF_RINGS = 14;      // radial steps per direction (resolution of the extrinsic ball fill)
 const REF_POINT_RADIUS = 0.045 * 1.5; // reference point c's sphere radius (1.5x the original)
-const POS_RANGE = 3.5; // u0,v0 clamp range — must match the slider min/max in index.html
+const POS_RANGE = 4.5; // u0,v0 clamp range: the whole rendered manifold (= DOMAIN); must match the slider min/max in index.html
 
 const state = {
   amplitude: 1,
@@ -183,22 +183,19 @@ function traceGeodesic(u0, v0, theta, length, steps) {
   let y = [u0, v0, du0, dv0];
   const h = length / steps;
   const pts = [{ u: u0, v: v0 }];
-  let exited = false;
   for (let i = 0; i < steps; i++) {
-    if (!exited) {
-      y = rk4Step(y, h);
-      // Renormalize speed under the metric to curb numerical drift.
-      const { E, F, G } = metricAt(y[0], y[1]);
-      const speed2 = E * y[2] * y[2] + 2 * F * y[2] * y[3] + G * y[3] * y[3];
-      if (speed2 > 1e-10) {
-        const s = 1 / Math.sqrt(speed2);
-        y[2] *= s; y[3] *= s;
-      }
-      // Left the rendered manifold: freeze at the last valid point.
-      if (Math.abs(y[0]) > DOMAIN || Math.abs(y[1]) > DOMAIN) exited = true;
+    y = rk4Step(y, h);
+    // Renormalize speed under the metric to curb numerical drift.
+    const { E, F, G } = metricAt(y[0], y[1]);
+    const speed2 = E * y[2] * y[2] + 2 * F * y[2] * y[3] + G * y[3] * y[3];
+    if (speed2 > 1e-10) {
+      const s = 1 / Math.sqrt(speed2);
+      y[2] *= s; y[3] *= s;
     }
-    if (exited) pts.push(pts[pts.length - 1]);
-    else pts.push({ u: y[0], v: y[1] });
+    // Geodesics are NOT stopped at the edge of the rendered manifold: f is
+    // defined everywhere, so they simply continue, and the per-pixel overlay
+    // only ever looks at the part that falls inside the visible surface.
+    pts.push({ u: y[0], v: y[1] });
   }
   return pts;
 }
@@ -250,6 +247,70 @@ function findAmbientSurfaceCrossingT(u0, v0, P, phi, R) {
     if (d < R) lo = mid; else hi = mid;
   }
   return (lo + hi) / 2;
+}
+
+/* ==========================================================================
+   Geodesic-distance map. Shoots GEO_FIELD_DIRS geodesics out of c, each
+   sampled at fine arc-length steps, and rasterizes the resulting polar grid
+   (a triangle mesh in (u,v), carrying "distance travelled" at each vertex)
+   into a GEO_FIELD_SIZE^2 texture covering the whole rendered domain. A
+   texel's value is then the geodesic distance from c to that point of the
+   manifold (1000 where no geodesic of length <= R reached it). Triangles
+   that stick out past the domain edge are simply clipped by the texture
+   bounds, so the map is complete right up to the border.
+   ========================================================================== */
+
+function computeGeodesicDistanceField(u0, v0, R) {
+  const S = GEO_FIELD_SIZE, cell = (2 * DOMAIN) / S;
+  const data = geoFieldData;
+  for (let i = 0; i < S * S; i++) data[i * 4] = 1000;
+
+  const STEPS = Math.max(8, Math.ceil(R / 0.03));
+  const h = R / STEPS;
+  const paths = [];
+  for (let d = 0; d < GEO_FIELD_DIRS; d++) {
+    paths.push(traceGeodesic(u0, v0, (2 * Math.PI * d) / GEO_FIELD_DIRS, R, STEPS));
+  }
+
+  const toGrid = (w) => (w + DOMAIN) / cell - 0.5; // world coord -> texel-center coord
+  const BARY_EPS = 1e-3;
+
+  function rasterTri(A, dA, B, dB, C, dC) {
+    const ax = toGrid(A.u), ay = toGrid(A.v);
+    const bx = toGrid(B.u), by = toGrid(B.v);
+    const cx = toGrid(C.u), cy = toGrid(C.v);
+    const minX = Math.max(0, Math.floor(Math.min(ax, bx, cx)));
+    const maxX = Math.min(S - 1, Math.ceil(Math.max(ax, bx, cx)));
+    const minY = Math.max(0, Math.floor(Math.min(ay, by, cy)));
+    const maxY = Math.min(S - 1, Math.ceil(Math.max(ay, by, cy)));
+    if (minX > maxX || minY > maxY) return;
+    if ((maxX - minX) * (maxY - minY) > 6000) return; // runaway triangle, ignore
+    const den = (by - cy) * (ax - cx) + (cx - bx) * (ay - cy);
+    if (Math.abs(den) < 1e-12) return;
+    for (let y = minY; y <= maxY; y++) {
+      for (let x = minX; x <= maxX; x++) {
+        const w0 = ((by - cy) * (x - cx) + (cx - bx) * (y - cy)) / den;
+        const w1 = ((cy - ay) * (x - cx) + (ax - cx) * (y - cy)) / den;
+        const w2 = 1 - w0 - w1;
+        if (w0 >= -BARY_EPS && w1 >= -BARY_EPS && w2 >= -BARY_EPS) {
+          const dist = w0 * dA + w1 * dB + w2 * dC;
+          const idx = (y * S + x) * 4;
+          if (dist < data[idx]) data[idx] = dist;
+        }
+      }
+    }
+  }
+
+  for (let d = 0; d < GEO_FIELD_DIRS; d++) {
+    const dn = (d + 1) % GEO_FIELD_DIRS;
+    for (let r = 0; r < STEPS; r++) {
+      const A = paths[d][r], B = paths[dn][r], C = paths[d][r + 1], D = paths[dn][r + 1];
+      const d0 = r * h, d1 = (r + 1) * h;
+      rasterTri(A, d0, B, d0, C, d1);
+      rasterTri(B, d0, D, d1, C, d1);
+    }
+  }
+  geoFieldTex.needsUpdate = true;
 }
 
 const container = document.getElementById('canvas-container');
@@ -319,6 +380,7 @@ function rebuildSurface() {
   surfaceGeom.setIndex(indices);
   surfaceGeom.computeVertexNormals();
   surfaceMesh.geometry = surfaceGeom;
+  regionMesh.geometry = surfaceGeom; // the ball overlay shares the manifold's mesh
 }
 
 /* ---- Sample points: a layer of points scattered on the manifold,
@@ -428,20 +490,6 @@ const e1Arrow = makeArrow(COLOR_E1);
 const e2Arrow = makeArrow(COLOR_E2);
 scene.add(normalArrow, e1Arrow, e2Arrow);
 
-/* ---- Intrinsic ball: geodesic ball (fill + boundary) ---- */
-let geoBallGeom = new THREE.BufferGeometry();
-const geoBallMat = new THREE.MeshBasicMaterial({
-  color: COLOR_INTRINSIC, side: THREE.DoubleSide, transparent: true, opacity: 0.92, depthWrite: false,
-  polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -1,
-});
-const geoBallMesh = new THREE.Mesh(geoBallGeom, geoBallMat);
-geoBallMesh.renderOrder = 1; // draw before the extrinsic ball, for consistent overlap rendering
-scene.add(geoBallMesh);
-
-let geoBoundaryGeom = new THREE.BufferGeometry();
-const geoBoundaryMat = new THREE.LineBasicMaterial({ color: COLOR_INTRINSIC, linewidth: 2 });
-const geoBoundaryLine = new THREE.LineLoop(geoBoundaryGeom, geoBoundaryMat);
-scene.add(geoBoundaryLine);
 
 /* ---- Ambient (Euclidean) ball ----
    A faint solid translucent sphere, not a wireframe cage: wireframe lines
@@ -476,51 +524,106 @@ const ambPlaneMat = new THREE.LineBasicMaterial({ color: COLOR_AMBIENT_GROUP, li
 const ambPlaneLine = new THREE.LineLoop(ambPlaneBoundaryGeom, ambPlaneMat);
 scene.add(ambPlaneLine);
 
-let ambSurfGeom = new THREE.BufferGeometry();
-const ambSurfFillMat = new THREE.MeshBasicMaterial({
-  color: COLOR_EXTRINSIC, side: THREE.DoubleSide, transparent: true, opacity: 0.92, depthWrite: false,
-  polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -1,
-});
-const ambSurfMesh = new THREE.Mesh(ambSurfGeom, ambSurfFillMat);
-ambSurfMesh.renderOrder = 2; // draw after the intrinsic ball, for consistent overlap rendering
-scene.add(ambSurfMesh);
+/* ---- Intrinsic & Extrinsic balls, painted per pixel ----
+   Instead of building each ball as a fan of rays (which tears and leaves
+   gaps wherever a ball runs into the edge of the manifold), an overlay
+   shares the manifold's own mesh and decides for EVERY PIXEL whether it
+   lies inside each ball:
+     - Extrinsic: is the straight-line 3D distance to c within R?  (exact)
+     - Intrinsic: is the geodesic distance to c within R?  (looked up in a
+       distance map computed on the CPU, see computeGeodesicDistanceField)
+   Because the overlay IS the manifold surface, regions are clipped by the
+   border exactly, and every pixel that should be painted gets painted.
+   Where a pixel is in both balls, a diamond (harlequin) pattern of the two
+   colors is drawn. */
+const GEO_FIELD_SIZE = 256;
+const GEO_FIELD_DIRS = 240;
+const DIAMOND_TILE = 0.16; // size of one diamond tile, in (u,v) units
+const geoFieldData = new Float32Array(GEO_FIELD_SIZE * GEO_FIELD_SIZE * 4);
+const geoFieldTex = new THREE.DataTexture(
+  geoFieldData, GEO_FIELD_SIZE, GEO_FIELD_SIZE, THREE.RGBAFormat, THREE.FloatType
+);
+geoFieldTex.minFilter = THREE.NearestFilter;  // bilinear is done by hand in the shader,
+geoFieldTex.magFilter = THREE.NearestFilter;  // so float textures need no linear-filter extension
+geoFieldTex.generateMipmaps = false;
+geoFieldTex.needsUpdate = true;
 
-let ambSurfBoundaryGeom = new THREE.BufferGeometry();
-const ambSurfMat = new THREE.LineBasicMaterial({ color: COLOR_EXTRINSIC, linewidth: 2 });
-const ambSurfLine = new THREE.LineLoop(ambSurfBoundaryGeom, ambSurfMat);
-scene.add(ambSurfLine);
-
-/* ---- Intrinsic ∩ Extrinsic: diamond (harlequin) pattern of both colors ----
-   Drawn only where the two balls overlap. The texture is an orange tile
-   with an inscribed purple rhombus; tiled, it gives alternating orange and
-   purple diamonds of equal area. UVs are the (u,v) surface coordinates, so
-   the pattern stays fixed to the manifold as the balls change size. */
-function makeDiamondTexture() {
-  const s = 64;
-  const canvas = document.createElement('canvas');
-  canvas.width = s; canvas.height = s;
-  const ctx = canvas.getContext('2d');
-  ctx.fillStyle = '#' + COLOR_INTRINSIC.toString(16).padStart(6, '0');
-  ctx.fillRect(0, 0, s, s);
-  ctx.fillStyle = '#' + COLOR_EXTRINSIC.toString(16).padStart(6, '0');
-  ctx.beginPath();
-  ctx.moveTo(s / 2, 0); ctx.lineTo(s, s / 2); ctx.lineTo(s / 2, s); ctx.lineTo(0, s / 2);
-  ctx.closePath();
-  ctx.fill();
-  const tex = new THREE.CanvasTexture(canvas);
-  tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
-  tex.magFilter = THREE.NearestFilter;
-  return tex;
-}
-const DIAMOND_TILE = 0.16; // world size of one diamond tile, in (u,v) units
-let intersectGeom = new THREE.BufferGeometry();
-const intersectMat = new THREE.MeshBasicMaterial({
-  map: makeDiamondTexture(), side: THREE.DoubleSide, transparent: true, opacity: 1, depthWrite: false,
+const regionMat = new THREE.ShaderMaterial({
+  transparent: true, depthWrite: false, side: THREE.DoubleSide,
   polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2,
+  extensions: { derivatives: true },
+  uniforms: {
+    uC: { value: new THREE.Vector3() },
+    uR: { value: 1 },
+    uDomain: { value: DOMAIN },
+    uSize: { value: GEO_FIELD_SIZE },
+    uTile: { value: DIAMOND_TILE },
+    uShowI: { value: 0 },
+    uShowE: { value: 0 },
+    uGeo: { value: geoFieldTex },
+    uColI: { value: new THREE.Color(COLOR_INTRINSIC) },
+    uColE: { value: new THREE.Color(COLOR_EXTRINSIC) },
+  },
+  vertexShader: `
+    varying vec3 vPos;
+    void main() {
+      vPos = position;
+      gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+    }
+  `,
+  fragmentShader: `
+    precision highp float;
+    uniform vec3 uC;
+    uniform float uR, uDomain, uSize, uTile, uShowI, uShowE;
+    uniform sampler2D uGeo;
+    uniform vec3 uColI, uColE;
+    varying vec3 vPos;
+
+    // Bilinear lookup of the geodesic-distance map at surface coords (u,v).
+    float geoDist(vec2 uv) {
+      vec2 t = (uv + uDomain) / (2.0 * uDomain) * uSize - 0.5;
+      vec2 i0 = floor(t);
+      vec2 fr = t - i0;
+      vec2 lo = clamp(i0, 0.0, uSize - 1.0);
+      vec2 hi = clamp(i0 + 1.0, 0.0, uSize - 1.0);
+      float a = texture2D(uGeo, (vec2(lo.x, lo.y) + 0.5) / uSize).r;
+      float b = texture2D(uGeo, (vec2(hi.x, lo.y) + 0.5) / uSize).r;
+      float c = texture2D(uGeo, (vec2(lo.x, hi.y) + 0.5) / uSize).r;
+      float d = texture2D(uGeo, (vec2(hi.x, hi.y) + 0.5) / uSize).r;
+      return mix(mix(a, b, fr.x), mix(c, d, fr.x), fr.y);
+    }
+
+    void main() {
+      vec2 uv = vPos.xz;
+      float dE = length(vPos - uC);
+      float dI = geoDist(uv);
+      bool inE = uShowE > 0.5 && dE <= uR;
+      bool inI = uShowI > 0.5 && dI <= uR;
+      if (!inE && !inI) discard;
+
+      vec3 col;
+      if (inE && inI) {
+        vec2 p = fract(uv / uTile);
+        col = (abs(p.x - 0.5) + abs(p.y - 0.5) < 0.5) ? uColE : uColI;
+      } else if (inI) {
+        col = uColI;
+      } else {
+        col = uColE;
+      }
+
+      // Thin outline along each ball's own boundary (constant pixel width).
+      float wE = clamp(fwidth(dE) * 1.3, 0.0005, 0.03);
+      float wI = clamp(fwidth(dI) * 1.3, 0.0005, 0.03);
+      if (uShowE > 0.5) col = mix(col, uColE * 0.65, 1.0 - smoothstep(0.0, wE, abs(dE - uR)));
+      if (uShowI > 0.5 && dI < 100.0) col = mix(col, uColI * 0.65, 1.0 - smoothstep(0.0, wI, abs(dI - uR)));
+
+      gl_FragColor = vec4(col, 0.93);
+    }
+  `,
 });
-const intersectMesh = new THREE.Mesh(intersectGeom, intersectMat);
-intersectMesh.renderOrder = 3;
-scene.add(intersectMesh);
+const regionMesh = new THREE.Mesh(surfaceGeom, regionMat);
+regionMesh.renderOrder = 1;
+scene.add(regionMesh);
 
 /* ---- Orientation axes: a small, unlabeled RGB triad that repositions
    itself to the far corner of the surface (relative to the camera) each
@@ -621,168 +724,13 @@ function rebuildIndicators() {
     ambPlaneLine.geometry = ambPlaneBoundaryGeom;
   }
 
-  // Extrinsic ball = ambient ball ∩ manifold: found numerically by walking
-  // straight rays in (u,v) parameter space (NOT geodesics) and bisecting
-  // for where the 3D distance to P equals ballRadius. The surface is
-  // curved, so (unlike the Tangent Ball) it's filled with multiple rings
-  // per direction, each ring scaled to a fraction of that direction's own
-  // crossing distance -- the same ring/fan construction as the Intrinsic
-  // (geodesic) ball below, just along straight parameter-space rays.
-  {
-    const crossingT = [];
-    for (let i = 0; i < AMB_SURF_DIRECTIONS; i++) {
-      const phi = (2 * Math.PI * i) / AMB_SURF_DIRECTIONS;
-      crossingT.push(findAmbientSurfaceCrossingT(u0, v0, P, phi, state.ballRadius));
-    }
-    const verts = [P.x, P.y, P.z];
-    for (let r = 1; r <= AMB_SURF_RINGS; r++) {
-      for (let d = 0; d < AMB_SURF_DIRECTIONS; d++) {
-        const phi = (2 * Math.PI * d) / AMB_SURF_DIRECTIONS;
-        const t = (r / AMB_SURF_RINGS) * crossingT[d];
-        const pt = point3D(u0 + Math.cos(phi) * t, v0 + Math.sin(phi) * t);
-        verts.push(pt.x, pt.y, pt.z);
-      }
-    }
-    const idxOf = (r, d) => 1 + (r - 1) * AMB_SURF_DIRECTIONS + d;
-    const faces = [];
-    for (let d = 0; d < AMB_SURF_DIRECTIONS; d++) {
-      const dn = (d + 1) % AMB_SURF_DIRECTIONS;
-      faces.push(0, idxOf(1, d), idxOf(1, dn));
-    }
-    for (let r = 2; r <= AMB_SURF_RINGS; r++) {
-      for (let d = 0; d < AMB_SURF_DIRECTIONS; d++) {
-        const dn = (d + 1) % AMB_SURF_DIRECTIONS;
-        const a = idxOf(r - 1, d), b = idxOf(r - 1, dn), c = idxOf(r, d), dd = idxOf(r, dn);
-        faces.push(a, c, b, b, c, dd);
-      }
-    }
-    ambSurfGeom.dispose();
-    ambSurfGeom = new THREE.BufferGeometry();
-    ambSurfGeom.setAttribute('position', new THREE.BufferAttribute(new Float32Array(verts), 3));
-    ambSurfGeom.setIndex(faces);
-    ambSurfGeom.computeVertexNormals();
-    ambSurfMesh.geometry = ambSurfGeom;
-
-    const boundary = [];
-    for (let d = 0; d < AMB_SURF_DIRECTIONS; d++) {
-      const idx = idxOf(AMB_SURF_RINGS, d) * 3;
-      boundary.push(verts[idx], verts[idx + 1], verts[idx + 2]);
-    }
-    ambSurfBoundaryGeom.dispose();
-    ambSurfBoundaryGeom = new THREE.BufferGeometry();
-    ambSurfBoundaryGeom.setAttribute('position', new THREE.BufferAttribute(new Float32Array(boundary), 3));
-    ambSurfLine.geometry = ambSurfBoundaryGeom;
-  }
-
-  // Intrinsic ball (geodesic ball): trace GEO_DIRECTIONS geodesics of
-  // length ballRadius -- the SAME radius used for the ambient ball, Tangent
-  // Ball and Extrinsic ball above -- sampled at GEO_RINGS+1 points each,
-  // and triangulate the resulting grid.
-  const paths = [];
-  for (let d = 0; d < GEO_DIRECTIONS; d++) {
-    const theta = (2 * Math.PI * d) / GEO_DIRECTIONS;
-    paths.push(traceGeodesic(u0, v0, theta, state.ballRadius, GEO_RINGS));
-  }
-
-  const verts = [P.x, P.y, P.z]; // vertex 0 = center
-  for (let r = 1; r <= GEO_RINGS; r++) {
-    for (let d = 0; d < GEO_DIRECTIONS; d++) {
-      const pt = point3D(paths[d][r].u, paths[d][r].v);
-      verts.push(pt.x, pt.y, pt.z);
-    }
-  }
-  const idxOf = (r, d) => 1 + (r - 1) * GEO_DIRECTIONS + d;
-  const faces = [];
-  for (let d = 0; d < GEO_DIRECTIONS; d++) {
-    const dn = (d + 1) % GEO_DIRECTIONS;
-    faces.push(0, idxOf(1, d), idxOf(1, dn));
-  }
-  for (let r = 2; r <= GEO_RINGS; r++) {
-    for (let d = 0; d < GEO_DIRECTIONS; d++) {
-      const dn = (d + 1) % GEO_DIRECTIONS;
-      const a = idxOf(r - 1, d), b = idxOf(r - 1, dn), c = idxOf(r, d), dd = idxOf(r, dn);
-      faces.push(a, c, b, b, c, dd);
-    }
-  }
-  geoBallGeom.dispose();
-  geoBallGeom = new THREE.BufferGeometry();
-  geoBallGeom.setAttribute('position', new THREE.BufferAttribute(new Float32Array(verts), 3));
-  geoBallGeom.setIndex(faces);
-  geoBallGeom.computeVertexNormals();
-  geoBallMesh.geometry = geoBallGeom;
-
-  const boundaryVerts = [];
-  for (let d = 0; d < GEO_DIRECTIONS; d++) {
-    const pt = point3D(paths[d][GEO_RINGS].u, paths[d][GEO_RINGS].v);
-    boundaryVerts.push(pt.x, pt.y, pt.z);
-  }
-  geoBoundaryGeom.dispose();
-  geoBoundaryGeom = new THREE.BufferGeometry();
-  geoBoundaryGeom.setAttribute('position', new THREE.BufferAttribute(new Float32Array(boundaryVerts), 3));
-  geoBoundaryLine.geometry = geoBoundaryGeom;
-
-  // Intrinsic ∩ Extrinsic. Both balls are star-shaped around c, so along any
-  // straight ray in (u,v) the overlap runs out to the SMALLER of the two
-  // radial extents. The extrinsic extent comes from the ambient-distance
-  // search; the intrinsic extent is where the ray leaves the geodesic ball's
-  // boundary polygon (its outer ring of (u,v) points).
-  {
-    const poly = [];
-    for (let d = 0; d < GEO_DIRECTIONS; d++) poly.push(paths[d][GEO_RINGS]);
-
-    const rayPolygonExitT = (du, dv) => {
-      let best = -1;
-      for (let i = 0; i < poly.length; i++) {
-        const A = poly[i], B = poly[(i + 1) % poly.length];
-        const ex = B.u - A.u, ev = B.v - A.v;
-        const det = -du * ev + ex * dv;
-        if (Math.abs(det) < 1e-12) continue;
-        const t = (-(A.u - u0) * ev + ex * (A.v - v0)) / det;
-        const s = (du * (A.v - v0) - dv * (A.u - u0)) / det;
-        if (t >= 0 && s >= 0 && s <= 1 && t > best) best = t;
-      }
-      return best; // -1 if the ray never meets the polygon
-    };
-
-    const N_I = AMB_SURF_DIRECTIONS;
-    const extent = new Float64Array(N_I);
-    for (let i = 0; i < N_I; i++) {
-      const phi = (2 * Math.PI * i) / N_I;
-      const du = Math.cos(phi), dv = Math.sin(phi);
-      const rExt = findAmbientSurfaceCrossingT(u0, v0, P, phi, state.ballRadius);
-      const rInt = rayPolygonExitT(du, dv);
-      extent[i] = rInt < 0 ? rExt : Math.min(rExt, rInt);
-    }
-
-    const LIFT = 0.004; // tiny lift so the pattern sits above both ball fills
-    const iVerts = [P.x, P.y + LIFT, P.z];
-    const iUVs = [u0 / DIAMOND_TILE, v0 / DIAMOND_TILE];
-    for (let r = 1; r <= AMB_SURF_RINGS; r++) {
-      for (let i = 0; i < N_I; i++) {
-        const phi = (2 * Math.PI * i) / N_I;
-        const t = (r / AMB_SURF_RINGS) * extent[i];
-        const u = u0 + Math.cos(phi) * t, v = v0 + Math.sin(phi) * t;
-        iVerts.push(u, f(u, v) + LIFT, v);
-        iUVs.push(u / DIAMOND_TILE, v / DIAMOND_TILE);
-      }
-    }
-    const iIdx = (r, d) => 1 + (r - 1) * N_I + d;
-    const iFaces = [];
-    for (let d = 0; d < N_I; d++) iFaces.push(0, iIdx(1, d), iIdx(1, (d + 1) % N_I));
-    for (let r = 2; r <= AMB_SURF_RINGS; r++) {
-      for (let d = 0; d < N_I; d++) {
-        const dn = (d + 1) % N_I;
-        const a = iIdx(r - 1, d), b = iIdx(r - 1, dn), c = iIdx(r, d), dd = iIdx(r, dn);
-        iFaces.push(a, c, b, b, c, dd);
-      }
-    }
-    intersectGeom.dispose();
-    intersectGeom = new THREE.BufferGeometry();
-    intersectGeom.setAttribute('position', new THREE.BufferAttribute(new Float32Array(iVerts), 3));
-    intersectGeom.setAttribute('uv', new THREE.BufferAttribute(new Float32Array(iUVs), 2));
-    intersectGeom.setIndex(iFaces);
-    intersectMesh.geometry = intersectGeom;
-  }
+  // Intrinsic & Extrinsic balls are painted per pixel by regionMat (see the
+  // scene setup). Extrinsic needs nothing precomputed (it tests the 3D
+  // distance to c directly); Intrinsic needs a geodesic-distance map of the
+  // manifold, which is only computed while that ball is switched on.
+  if (state.vis.geodesicBall) computeGeodesicDistanceField(u0, v0, state.ballRadius);
+  regionMat.uniforms.uC.value.copy(P);
+  regionMat.uniforms.uR.value = state.ballRadius;
 
   // Readout
   const K = gaussianCurvatureAt(u0, v0);
@@ -801,14 +749,12 @@ function applyVisibility() {
   normalArrow.visible = v.normal;
   e1Arrow.visible = v.basis;
   e2Arrow.visible = v.basis;
-  geoBallMesh.visible = v.geodesicBall;
-  geoBoundaryLine.visible = v.geodesicBoundary;
   ambientMesh.visible = v.ambientBall;
   ambPlaneMesh.visible = v.ambientPlaneCircle;
   ambPlaneLine.visible = v.ambientPlaneCircle;
-  ambSurfMesh.visible = v.ambientSurfaceCurve;
-  ambSurfLine.visible = v.ambientSurfaceCurve;
-  intersectMesh.visible = v.geodesicBall && v.ambientSurfaceCurve;
+  regionMat.uniforms.uShowI.value = v.geodesicBall ? 1 : 0;
+  regionMat.uniforms.uShowE.value = v.ambientSurfaceCurve ? 1 : 0;
+  regionMesh.visible = v.surface && (v.geodesicBall || v.ambientSurfaceCurve);
   axesHelper.visible = v.axes;
   gridHelper.visible = v.grid;
   samplePointsObj.visible = v.points;
@@ -861,6 +807,7 @@ document.getElementById('vis-intrinsic').addEventListener('change', (e) => {
   state.vis.geodesicBall = e.target.checked;
   state.vis.geodesicBoundary = e.target.checked;
   applyVisibility();
+  if (e.target.checked) needsIndicatorRebuild = true; // compute the geodesic-distance map now
 });
 
 document.getElementById('reset-point').addEventListener('click', () => {
